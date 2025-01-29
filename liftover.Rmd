@@ -1,0 +1,217 @@
+---
+title: "liftover"
+author: "Lauren Spor"
+date: "2024-12-05"
+output: html_document
+---
+
+This document is an example of lifting over a file from hg38 to hg19. You can liftover your files to a different assembly using a different chain. Chains can be found on this [UCSC Genome Browser page](https://hgdownload.soe.ucsc.edu/downloads.html#liftover).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=F, eval=TRUE}
+library("tidyverse")
+library("data.table")
+library("SeqVarTools")
+library("magrittr")
+library("rtracklayer")
+library("GenomicRanges")
+library("GenomeInfoDb")
+library("R.utils")
+```
+
+
+## Chain
+Import your desired chain for liftOver. This example converts from hg38 to hg19, but you can alter the chain to meet your needs.
+```{r}
+chain_path <- system.file(package = "liftOver",
+                          "extdata",
+                          "hg38ToHg19.over.chain")
+chain <- import.chain(chain_path)
+chain
+```
+
+
+## GDS Files [OPTIONAL]
+My data has alleles listed as Allele1 and Allele2. I'd like to convert the data to ref and alt alleles, so I will pull this information from the GDS files. To do this, I created a dataframe of the file names. You can skip this section if your alleles are already in the ref/alt format.
+```{r}
+# paths to GDS files
+gds_path <- "/home/mok36/imputation_code/freeze9b/discovery/14_make_gds/"
+gds_path_disc <- "/home/mok36/imputation_code/freeze9b/discovery/14_make_gds/discovery-"
+gds_path_rep <- "/home/mok36/imputation_code/freeze9b/replication/14_replication_make_gds/replication-"
+
+# pull the GDS file names from the discovery files
+# remove the discovery prefix so the file names can be used for replication too
+gds_files <- data.frame(filename = list.files(
+  path = gds_path,
+  pattern = "*.dose.gds")) %>% 
+  mutate(chr = str_replace(filename,
+                           pattern = "discovery-9b-samoa-chr*", "")) %>% 
+  mutate(chr = as.numeric(str_replace(chr, pattern = ".dose.gds", ""))) %>% 
+  arrange(chr) %>% 
+  select(chr, filename) %>% 
+  mutate(filename = str_replace(filename,
+                                pattern = "discovery-", ""))
+
+gds_files$chr[23] <- 23
+head(gds_files)
+tail(gds_files)
+```
+
+Next, write a function to pull variant chromosome, position, and alleles from each GDS file.
+```{r}
+pull_variant_info <- function(gds_df, path_name){
+  for (row in 1:nrow(gds_df)){
+      file_name <- paste0(path_name, gds_df$filename[row])
+      gds <- seqOpen(file_name)
+      variants <- variantInfo(gds, alleles=TRUE)
+      if (row == 1){
+        df <- variants
+      }
+      else {
+        df <- rbind(df, variants)
+        }
+      seqClose(gds)
+  }
+  df <- select(df, !"variant.id")
+  return(df)
+}
+```
+
+Now, extract all of the variants from the discovery and replication GDS files, and perform a full join.
+```{r}
+# extract variants from discovery GDS files
+disc_variants <- pull_variant_info(gds_files, gds_path_disc)
+
+# extract variants from replication GDS files
+rep_variants <- pull_variant_info(gds_files, gds_path_rep) %>% 
+  # remove duplicate rows with empty entries
+  filter(alt != "")
+
+# merge variant lists
+variant_master_list <- full_join(disc_variants, rep_variants,
+                                  by = c("chr", "pos", "ref", "alt"))
+# preview data
+head(variant_master_list)
+tail(variant_master_list)
+dim(variant_master_list)
+
+# confirm that there is no missing data
+anyNA(variant_master_list)
+```
+There is no missing data.
+
+
+## Your Data
+
+Import your data here by adjusting the path to your file.
+```{r}
+imported_data <- fread("~/metabolic_gwas/insulin_metadata.txt")
+head(imported_data)
+tail(imported_data)
+dim(imported_data)
+```
+
+My example data is the output from METAL and contains the following columns: "chr", "pos", "Allele1", "Allele2", "Weight", "Zscore", "P.value", and "Direction". You will need to adjust the following code depending on the names of your columns and whether you need to merge your file with GDS variant info.
+
+Since we are using GRanges to convert our coordinates, we do need to add start and end columns.
+```{r}
+edited_data <- imported_data %>%  
+  
+  # change chr 23 to X; needed if merging with GDS files for consistent naming
+  mutate(chr = as.character(chr)) %>% 
+  mutate(chr = str_replace_all(chr, "23", "X")) %>% 
+  
+  # merge your data with variant master list by chromosome & position
+  left_join(variant_master_list, by = c("chr", "pos")) %>% 
+  
+  # rename position to 'start' for liftover
+  dplyr::rename(start = pos) %>%
+  
+  # create end column for liftover
+  # the end position depends upon the number of characters in the ref column
+  # this line does not account for ref alleles that are listed as "I" or "D", which are in the GDS files
+  mutate(end = start + nchar(ref)) %>% 
+  
+  # pick columns to keep
+  # the first three columns must be chr, start, and end
+  # in this example, the weight is the sample size, which may be needed for downstream analysis
+  select("chr", "start", "end", "ref", "alt", "P.value", "Weight") %>% 
+  
+  # add 'chr' prefix for liftover
+  mutate(chr = paste0("chr", chr))
+
+dim(edited_data)
+head(edited_data)
+tail(edited_data)
+anyNA(edited_data)           #check that there are no NA 
+```
+
+## Liftover
+
+Make a granges object for liftOver. You can keep your extra columns with the `keep.extra.columns` argument. Be sure to edit your original genome build if you are not starting with hg38.
+```{r}
+# created GRanges object
+pheno_granges <- makeGRangesFromDataFrame(edited_data,
+                                            keep.extra.columns = TRUE)
+
+# specify your genome build. Change if needed
+genome(pheno_granges) <- "hg38"
+
+# preview data
+pheno_granges
+```
+
+
+Now, we liftover our GRanges object to our desired build. This example converts the build from hg38 to hg19. If you want to change the build to something else, be sure to use the appropriate chain.
+```{r}
+seqlevelsStyle(pheno_granges) <- "UCSC"
+pheno_lifted <- liftOver(pheno_granges, chain)
+```
+
+
+## Reformat data as desired
+
+Now, our data has been converted, but we may want to convert the GRanges object back to a dataframe.
+
+Edit this section as desired, as it is stylistic for your needs. I chose to drop all rows that were mapped to chrY, as none of my original data contained chrY SNPs, and the program I wanted to run did not accept chrY SNPs.
+
+```{r}
+pheno_final <- as.data.frame(unlist(pheno_lifted)) %>% 
+  # rename chromosome column
+  dplyr::rename(chr = seqnames) %>% 
+  # remove "chr" prefix
+  mutate(chr = str_replace_all(as.character(chr), "chr", "")) %>%
+  # remove rows incorrectly mapped to chrY
+  filter(chr != "Y") %>%
+  # convert chrX to 23 and change the column to be integers
+  mutate(chr = as.integer(str_replace_all(chr, "X", "23"))) %>% 
+  # choose columns to keep
+  select(c(chr, start, ref, alt, P.value, Weight))
+  
+head(pheno_final)
+tail(pheno_final)
+sort(unique(pheno_final$chr))
+anyNA(pheno_final)
+```
+Check to see if any variants were not lifted over. In my example, about 31k variants were not lifted over or were incorrectly mapped to chrY.
+```{r}
+nrow(edited_data) - nrow(pheno_final)
+dim(edited_data)
+dim(pheno_final)
+```
+
+## Save data
+Save your data to run as needed
+```{r, eval = FALSE}
+fwrite(pheno_final, "~/your_folder/your_path.txt",
+       sep = "\t")
+
+# zip the file for storage
+gzip("~/your_folder/your_path.txt", 
+     "~/your_folder/your_path.txt.gz")
+```
+
+
