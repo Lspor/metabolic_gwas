@@ -1,0 +1,362 @@
+---
+title: "cojo_pipeline"
+author: "Lauren Spor"
+date: "2024-11-22"
+output: html_document
+---
+
+The goal of this document is to create a pipeline for a conditional & joint association analysis using GWAS summary data. We will use the GCTA COJO software detailed [here](https://yanglab.westlake.edu.cn/software/gcta/#COJO).
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=F, eval=TRUE}
+library("tidyverse")
+library("magrittr")
+library("data.table")
+```
+
+
+## COJO Input Files
+
+### PLINK bfiles
+
+COJO uses PLINK bfiles (.bed, .bim, and .fam) for a reference sample. We are using the 2010 Samoan discovery cohort for our reference sample (dbGaP Study Accession: phs000914.v1.p1).
+
+PLINK bfiles for each chromosome can be found in the following directory:
+```
+/home/lms288/shared_data/plink/plink_no_rsID
+```
+These files include imputed SNPs. SNPs with poor imputation (R2 <= 0.03) and monomorphic SNPs (MAF < 0.0001) have been removed.
+
+
+### COJO .ma file
+The input file for COJO must be summary statistics from a GWAS (meta or single GWAS are okay). This file should end in ".ma" (meaning meta analysis).
+
+Required columns are as follows:
+
+- SNP
+- A1 (effect allele)
+- A2 (alt allele)
+- freq (effect allele frequency)
+- b (effect size)
+- se (standard error)
+- p (p-value)
+- N (sample size)
+
+
+#### Create variant dataframe
+
+We will use a master list of SNP ids for our .ma file
+
+Note that since we are only using the discovery PLINK files for cojo, we will only pull variants from the discovery PLINK files. Variants that are only present in the replication data will not be included.
+
+To save time, you can read in the variant table generated on 1/22/2025. Alternatively, you can generate the variant table again using the code chunk below.
+
+```{r, eval = FALSE}
+# path to plink files with SNP id
+plink_path <- "/home/lms288/shared_data/plink/plink_no_rsID/"
+
+# create list of bim files to pull from
+bim_files <- list.files(path = plink_path, pattern = ".bim$")
+
+# create empty dataframe
+variant_info <- data.frame(chr = as.integer(),
+                           pos = as.integer(),
+                           SNP = as.character())
+
+# pull variant information
+for (i in bim_files) {
+  bim_df <- fread(paste0(plink_path, i))
+  bim_df %<>%
+    dplyr::rename(chr = V1, SNP = V2, pos = V4) %>%
+    select(chr, pos, SNP)
+  variant_info <- rbind(variant_info, bim_df)
+}
+
+# save data
+fwrite(variant_info, "~/shared_data/scripts/cojo/variant_info.tbl", sep = "\t")
+```
+
+
+Read in file and preview data:
+```{r}
+variant_info <- fread("/home/lms288/shared_data/scripts/cojo/variant_info.tbl")
+head(variant_info)
+tail(variant_info)
+dim(variant_info)
+```
+
+
+#### Create .ma file
+Read in your METAL file with GWAS summary stats. Change the file path to your file and any parameters as needed.
+
+```{r}
+# example; change this to your data
+gwas_file <- "/home/lms288/metabolic_gwas/meta_analysis/homair/homair_1.tbl"
+```
+
+```{r}
+gwas <- fread(gwas_file,
+              header = TRUE,
+              sep = "\t")
+head(gwas)
+tail(gwas)
+dim(gwas)
+```
+
+Check the column names of your gwas file to ensure they match with the ones listed in the `create_ma()` function. If they do not match, edit the function as needed or edit your column names.
+
+The `create_ma()` function expects the following column names in your gwas dataframe:
+
+- MarkerName
+- Allele1
+- Allele2
+- Freq1
+- Weight
+- Zscore
+- P-value
+
+```{r}
+create_ma <- function(gwas_file){
+  gwas_file %<>% 
+    # first, separate chr and position columns
+    separate(MarkerName, c("chr", "pos")) %>%
+    
+    # next, replace X chrm with 23 for sorting
+    mutate(across("chr", str_replace_all, "X", "23")) %>%
+    
+    # change both chr and pos to integers
+    mutate(across(c(chr, pos), as.integer)) %>%
+    
+    # sort across both columns
+    arrange(chr, pos) %>%
+    
+    # merge with variant_info to obtain SNP name
+    # use inner join to drop variants not present in reference PLINK file
+    # keeping variants not present in reference will cause cojo to fail
+    inner_join(variant_info, by = c("chr", "pos")) %>%
+    
+    # change Allele formatting to be uppercase as standard practice (if needed)
+    mutate(across(c(Allele1, Allele2), str_to_upper)) %>%
+    
+    # create columns for ref and alt alleles
+    mutate(ref = str_split_i(SNP, ":", 3)) %>% 
+    mutate(alt = str_split_i(SNP, ":", 4)) %>%
+    
+    # update freq & beta to relate to the alt allele
+    mutate(
+      freq = if_else(alt == Allele1, (1-Freq1), Freq1),
+      b = if_else(alt == Allele1, (Zscore*-1), Zscore)
+    ) %>%
+
+    # rename columns for cojo
+    dplyr::rename(A1 = alt, A2 = ref, N = Weight, p = "P-value") %>%
+    
+    # use a standard error of 1
+    mutate(se = 1) %>%
+    
+    # select relevant columns to keep
+    select(SNP, A1, A2, freq, b, se, p, N)
+  
+  return(gwas_file)
+}
+```
+
+Create your .ma file. This takes a several minutes.
+```{r}
+ma_file <- create_ma(gwas)
+dim(ma_file)
+anyNA(ma_file)
+head(ma_file)
+tail(ma_file)
+```
+
+
+Save your .ma file
+```{r, eval = FALSE}
+# change the file and path
+fwrite(ma_file, file = "~/metabolic_gwas/cojo/homair/homair.ma", sep = "\t")
+```
+
+
+#### Read .ma file
+If you already have an .ma file, you can use the `read_ma_file` function to view your file and check that the column names are correct.
+
+This function does the following steps:
+
+1. Read GWAS file
+2. Check that all columns are present and in order
+3. Return an error if the column names are incorrect
+4. Return the dataframe
+
+```{r}
+read_ma_file <- function(file_name) {
+  # Step 1: Read GWAS metadata (.ma) file
+  input_file <- fread(file_name)
+  
+  # Step 2: check that all column names are present and in order
+  ma_col_names <- c("SNP", "A1", "A2", "freq", "b", "se", "p", "N")
+  
+  # Step 3: return an error message if the column names or order are incorrect.
+  if (all(ma_col_names == names(input_file)) == TRUE){
+    print("All column names and order are correct")
+  }
+  else {
+    print("Error in spelling or order of column names.")
+  }
+  
+  # Step 4: return .ma file
+  return(input_file)
+}
+```
+
+Example:
+```
+homair_ma <- read_ma_file("~/metabolic_gwas/cojo/homair/homair.ma")
+head(homair_ma)
+```
+
+
+### Conditional SNPs
+To run conditional analysis, we provide a list of SNPs to condition on (e.g., top hits at each locus from your GWAS). The SNP ID must be an exact match to the SNP name/format in the .ma file and plink bfiles. This input file is one column with one SNP in each row. There are no headers. The minimum number of SNPs is 1.
+
+Change the `cojo_dir` and `top_hit_file` to your intended directory for cojo files & your top hits file.
+My top hits file has separate columns for the chromosome, position, reference & alt alleles, so I will merge them together in the next step to match the PLINK ID format.
+```{r}
+cojo_dir <- "~/metabolic_gwas/cojo/homair/"
+top_hit_file <- "homair_top_hits.tbl"
+top_hits <- fread(paste0(cojo_dir, top_hit_file))
+top_hits
+```
+
+For each row in your `top_hits` dataframe, this for loop will create a snplist of a single SNP to condition your cojo analysis. Change this for loop if you'd like multiple SNPs included in one conditional analysis file.
+```{r}
+for (i in 1:nrow(top_hits)){
+  cond_snp <- paste(top_hits[i, 1:4], collapse = ":")
+  filename <- paste0(cojo_dir, "chr", top_hits[i,1], "_", top_hits[i,2], ".snplist")
+  writeLines(cond_snp, filename)
+}
+```
+
+
+## COJO Analysis
+
+### Introduction
+We will use the following arguments when running COJO:
+
+- bfile: the plink bed/bim/fam files
+- chr: the chromosome
+- maf: the minor allele frequency (using 0.01 default)
+- cojo-file: the test stats (.ma file)
+- cojo-cond: the list of snps to condition on
+- cojo-wind: the distance (Kb) of SNPs in linkage equilibrium (using default 10000)
+- cojo-collinear: the R2 cutoff value for collinearity (using 0.9 default)
+- diff-freq: exclude snps with allele freqs >0.5 diff between the summary stats and LD reference sample (not using 0.2 default)
+- cojo-gc: adjust p-val by genomic control method
+- out: name and location to save output file
+
+LD is estimated from the reference sample. In our case, the reference sample is the 2010 Samoan discovery cohort. The distance of SNPs in linkage equilibrium should not be less than the default, as Samoan LD blocks tend to be larger than other populations.
+
+COJO depends on having summary stats for all SNVS, not just a subset. This is needed for phenotypic variance. The --extract option may also be used to limit the genomic region analyzed.
+
+### Function
+I created the `run_cojo()` function in the bash script `run_cojo.sh`, which uses an input file to run cojo in parallel for each analysis. 
+
+```
+run_cojo() {
+
+  # Assign variables
+  CHR=$1
+  MA_FILE=$2
+  COND_SNPLIST=$3
+  OUTPUT_FILE=$4
+
+  PLINK_FILE="/home/lms288/shared_data/plink/plink_no_rsID/discovery_hg38_no_rsID_chr${CHR}"
+
+  # run COJO
+
+  gcta --bfile $PLINK_FILE \
+       --chr $CHR \
+       --maf 0.01 \
+       --cojo-file $MA_FILE \
+       --cojo-cond $COND_SNPLIST \
+       --cojo-wind 10000 \
+       --cojo-collinear 0.9 \
+       --diff-freq 0.5 \
+       --cojo-gc \
+       --out $OUTPUT_FILE
+}
+```
+
+### run_cojo.sh Input File
+The `run_cojo.sh` script requires an input file with the variables and file names to execute cojo.
+
+Each row is one analysis/cojo run. The column order is sensitive and must be as follows:
+
+- CHR
+- MA_FILE
+- COND_SNPLIST
+- OUTPUT_FILE
+
+Do not include column names or row names in your document.
+Use a single whitespace delimiter in your file.
+
+Below is an example of an input .txt file:
+
+```
+1 glucose.ma chr1.snplist chr1
+12 glucose.ma chr12.snplist chr12
+3 glucose.ma chr3.snplist chr3
+5 glucose.ma chr5.snplist chr5
+8 glucose.ma chr8.snplist chr8
+9 glucose.ma chr9.snplist chr9
+```
+
+You can use the `create_cojo_table()` function (below) to create this file. If you edited the for loop to create the conditional snpList files, then you may need to edit the function below too.
+
+This function assumes that there is only one .ma file in your folder.
+
+```{r}
+create_cojo_table <- function(path_name){
+  MA_FILE <- list.files(path = path_name, pattern = ".ma$")
+  COND_SNPLIST <- c(list.files(path = path_name, pattern = ".snplist"))
+  OUTPUT <- str_replace(COND_SNPLIST, c(".snplist"), "")
+  CHR <- str_extract(OUTPUT, "[^_]+")
+  CHR <- str_replace(CHR, c("chr"), "")
+  cojo_df <- data.frame(CHR, MA_FILE, COND_SNPLIST, OUTPUT)
+  return(cojo_df)
+}
+```
+
+```{r}
+cojo_df <- create_cojo_table(cojo_dir)
+cojo_df
+```
+
+Be sure to save your file to your directory. Keep the file name "cojo_df.txt" for easy running in run_cojo.sh. If you change the file name, be sure to update the sun grid engine script too.
+```{r, eval = FALSE}
+fwrite(cojo_df, paste0(cojo_dir, "cojo_df.txt"), sep = " ", col.names = FALSE)
+```
+
+
+### Execute Analyses
+First, locate the `run_cojo.sh` script.
+
+Next, change the directory to the folder with your documents.
+
+Then, change the -t argument (line 5) to be 1-N, where N is the number of rows in `cojo_df.txt`, created in the step above.
+
+Edit any parameters as needed, then save the file. 
+
+Lastly, if using sun grid engine, run 'qsub run_cojo.sh' in your terminal. Note that the output files generated by sun grid engine will be saved in the folder where you are running the bash script, so you should ideally run it from your `cojo_dir` folder.
+
+This script runs each analysis in parallel using the following line:
+
+```
+run_cojo $(sed -n ${SGE_TASK_ID}p "cojo_df.txt")
+```
+
+
