@@ -1,0 +1,68 @@
+---
+title: "create_auxiliary_files"
+author: "Lauren Spor"
+date: "2024-12-12"
+output: html_document
+---
+
+We need to create auxiliary files for the create_plink_files.sh pipeline.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=F, eval=TRUE}
+library("tidyverse")
+library("magrittr")
+library("data.table")
+```
+
+
+```{r}
+getwd()
+```
+
+First, we create a list of subject IDs. We need to filter out 1000 Genomes participants and only include our discovery Samoan cohort. This should have 3,119 people.
+```{bash}
+# path to VCF files
+VCF_PATH="/home/mok36/imputation_code/freeze9b/discovery/12_final_merge"
+
+# The VCF files include the Samoan discovery cohort & 1000 Genomes
+# Here, we create a file containing only the discovery subject IDs for filtering:
+
+bcftools query -l $VCF_PATH/discovery-9b-hg38-final-merge-chr1.dose.vcf.gz | \
+    grep "SG" > subject_ids.txt
+```
+
+
+Next, we create an auxiliary file with sex information for our participants.
+Without this, sex information will be missing for everyone.
+
+
+```{r}
+# load fam file that was submitted to dbgap for sex info
+dbgap_fam <- fread(
+  "/home/shared_data/samoa/dbGAP_Samoa/final_submitted_files/dbgap-submission-genetic-data/samoa-gwas-dbgap.fam")
+
+# load file we just created with subject IDs
+# we'll use our file to maintain the same order
+update_sex <- fread("/home/lms288/shared_data/plink/subject_ids.txt",
+                       header = FALSE)
+
+# convert to plink's required format: FID, IID, Sex
+update_sex %<>% 
+  # we don't have family members, so our FID & IID will be the same
+  mutate(V2 = V1) %>% 
+  # merge sex data from dbgap fam file
+  left_join(dbgap_fam[, c("V2", "V5")], by = "V2")
+
+# check data
+head(update_sex)
+dim(update_sex)
+anyNA(update_sex)
+```
+Save file
+```{r}
+fwrite(update_sex, file = "update_sex.txt", sep = " ", col.names = FALSE)
+```
+
